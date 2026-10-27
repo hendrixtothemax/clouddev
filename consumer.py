@@ -120,6 +120,7 @@ def handle_create_request(
     if dynamodb_table is not None:
         item: dict[str, str] = {
             "id": request.widget_id,
+            "widget_id": request.widget_id,
             "owner": request.owner,
         }
 
