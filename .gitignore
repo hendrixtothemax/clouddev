@@ -1,6 +1,7 @@
 producer.jar
 sample-requests.zip
 .vscode
+s3_bucket_list.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
