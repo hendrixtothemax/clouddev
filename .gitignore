@@ -1,5 +1,6 @@
 producer.jar
 sample-requests.zip
+.vscode
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
