@@ -1,8 +1,42 @@
-# Widget Consumer
+# CloudDev Readme
 
-## Run the consumer
+Goal: to hold the code for clouddev class and have a place to keep it all.
 
-Run from the project directory with AWS credentials configured. The consumer polls the request bucket until stopped; `--max-runtime` is in milliseconds and defaults to unlimited.
+## Python install instructions:
+
+From the project directory, make sure Python 3.11 or newer is installed:
+
+```bash
+python3 --version
+```
+
+Create and activate a virtual environment named `clouddev`:
+
+```bash
+python3 -m venv clouddev
+source clouddev/bin/activate
+```
+
+With the environment active, install the project requirements:
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+To leave the environment later, run:
+
+```bash
+deactivate
+```
+
+If `python3` points to a version older than 3.11, use your system’s Python 3.11+ command instead, such as `python3.11`.
+
+## Widget Consumer
+
+### Run the consumer
+
+Run from the project directory with AWS credentials configured. Make sure the venv is activated. The consumer polls the request bucket until stopped; `--max-runtime` is in milliseconds and defaults to unlimited.
 
 ```bash
 python consumer.py -rb usu-cs5270-umi-requests -dwt widgets -p clouddev
