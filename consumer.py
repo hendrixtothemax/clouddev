@@ -208,14 +208,12 @@ def main() -> None:
     request_source.add_argument(
         "-rb",
         "--request-bucket",
-        required=True,
         help="S3 bucket containing widget requests",
     )
     request_source.add_argument(
         "-rq",
         "--request-queue",
         type=str,
-        default=None,
         help="URL of queue that will contain requests (default=None)"
     )
 
