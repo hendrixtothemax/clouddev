@@ -228,6 +228,14 @@ def main() -> None:
         default="widgets/",
         help="S3 key prefix for widgets (default: widgets/)",
     )
+
+    parser.add_argument(
+        "-rq",
+        "--request-queue",
+        default=None,
+        help="URL of queue that will contain requests (default=None)"
+    )
+
     args = parser.parse_args()
 
     logging.basicConfig(
