@@ -7,8 +7,8 @@ import boto3
 
 from consumer import (
     WidgetRequest,
+    S3RequestReader,
     handle_create_request,
-    new_requests,
 )
 
 
@@ -144,9 +144,11 @@ class ConsumerOnlineTests(unittest.TestCase):
         )
 
         try:
-            requests = new_requests(self.s3, bucket)
-            self.assertEqual(len(requests), 1)
-            self.assertEqual(requests[0].widget_id, widget_id)
+            reader = S3RequestReader(self.s3, bucket)
+            request = reader.get_next_request()
+            self.assertIsNotNone(request)
+            self.assertEqual(request.widget_id, widget_id)
+            reader.delete_request(request)
             remaining = self.s3.list_objects_v2(
                 Bucket=bucket, Prefix=key, MaxKeys=1
             ).get("Contents", [])
