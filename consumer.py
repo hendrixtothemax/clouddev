@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 
 import boto3
 from botocore.client import BaseClient
+from botocore.exceptions import ClientError
 
 @dataclass
 class WidgetAttribute:
@@ -119,19 +120,13 @@ class S3RequestReader(RequestReader):
 class SqsRequestReader(RequestReader):
     """Reads requests from an SQS queue in batches of up to 10.
 
-    TODO (Step 2/3):
-      get_next_request:
-        - If the cache is empty, call receive_message with QueueUrl,
-          MaxNumberOfMessages=10 and WaitTimeSeconds=self.wait_seconds.
-        - For each message, parse msg["Body"] with self.parse_request().
-          Malformed bodies: delete the message now (no DLQ is configured).
-          Good ones: append (request, msg["ReceiptHandle"]) to self._cache.
-        - Pop the first cached entry, remember its receipt handle in
-          self._receipt_handles, and return the request (None if empty).
-      delete_request:
-        - Pop the receipt handle for request.request_id and call
-          delete_message(QueueUrl=..., ReceiptHandle=...).
+    One receive_message call (with long polling) fills a local cache, and
+    get_next_request hands the cached requests out one at a time. Each
+    request's receipt handle is kept so delete_request can remove the
+    message after it has been processed.
     """
+
+    MAX_BATCH_SIZE = 10  # SQS limit for receive_message
 
     def __init__(
         self, client: BaseClient, queue_url: str, wait_seconds: int = 10
@@ -145,10 +140,60 @@ class SqsRequestReader(RequestReader):
         self._receipt_handles: dict[str, str] = {}
 
     def get_next_request(self) -> WidgetRequest | None:
-        raise NotImplementedError("SQS retrieval is not implemented yet.")
+        if not self._cache:
+            self._fill_cache()
+        if not self._cache:
+            return None
+
+        request, receipt_handle = self._cache.pop(0)
+        self._receipt_handles[request.request_id] = receipt_handle
+        return request
 
     def delete_request(self, request: WidgetRequest) -> None:
-        raise NotImplementedError("SQS message deletion is not implemented yet.")
+        receipt_handle = self._receipt_handles.pop(request.request_id, None)
+        if receipt_handle is None:
+            logging.warning(
+                "No receipt handle for request %s; nothing to delete.",
+                request.request_id,
+            )
+            return
+        self._delete_message(receipt_handle)
+        logging.info("Deleted request %s from queue.", request.request_id)
+
+    def _fill_cache(self) -> None:
+        """Receive up to 10 messages and cache the ones that parse."""
+        response = self.client.receive_message(
+            QueueUrl=self.queue_url,
+            MaxNumberOfMessages=self.MAX_BATCH_SIZE,
+            WaitTimeSeconds=self.wait_seconds,
+        )
+        messages = response.get("Messages", [])
+        if messages:
+            logging.info("Received %d message(s) from queue.", len(messages))
+
+        for message in messages:
+            receipt_handle = message["ReceiptHandle"]
+            request = self.parse_request(message.get("Body", ""))
+            if request is None:
+                # No dead-letter queue is configured, so a malformed message
+                # would otherwise be redelivered forever.
+                self._delete_message(receipt_handle)
+                logging.error(
+                    "Deleted malformed message %s from queue.",
+                    message.get("MessageId"),
+                )
+                continue
+            self._cache.append((request, receipt_handle))
+
+    def _delete_message(self, receipt_handle: str) -> None:
+        try:
+            self.client.delete_message(
+                QueueUrl=self.queue_url, ReceiptHandle=receipt_handle
+            )
+        except ClientError as error:
+            # Usually an expired receipt handle (visibility timeout passed);
+            # the message will be redelivered and handled again.
+            logging.error("Failed to delete message from queue: %s", error)
 
 
 # Request Processing
