@@ -203,11 +203,20 @@ def main() -> None:
         default=0,
         help="Maximum runtime in milliseconds; 0 means no maximum",
     )
-    parser.add_argument(
+
+    request_source = parser.add_mutually_exclusive_group(required=True)
+    request_source.add_argument(
         "-rb",
         "--request-bucket",
         required=True,
         help="S3 bucket containing widget requests",
+    )
+    request_source.add_argument(
+        "-rq",
+        "--request-queue",
+        type=str,
+        default=None,
+        help="URL of queue that will contain requests (default=None)"
     )
 
     destination = parser.add_mutually_exclusive_group(required=True)
@@ -227,13 +236,6 @@ def main() -> None:
         "--widget-key-prefix",
         default="widgets/",
         help="S3 key prefix for widgets (default: widgets/)",
-    )
-
-    parser.add_argument(
-        "-rq",
-        "--request-queue",
-        default=None,
-        help="URL of queue that will contain requests (default=None)"
     )
 
     args = parser.parse_args()
