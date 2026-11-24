@@ -248,7 +248,13 @@ def main() -> None:
         profile_name=args.profile,
         region_name=args.region,
     )
-    request_s3_client = session.client("s3")
+    request_s3_client = None
+    sqs_client = None
+
+    if args.request_queue:
+        sqs_client = session.client("sqs")
+    else:
+        request_s3_client = session.client("s3")
 
     widget_s3_client = None
     dynamodb_table = None
