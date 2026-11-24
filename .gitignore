@@ -2,6 +2,7 @@ producer.jar
 sample-requests.zip
 .vscode
 s3_bucket_list.py
+docker.env
 
 /logs/*
 /system-test-logs/*
