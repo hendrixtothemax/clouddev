@@ -217,6 +217,12 @@ def widget_as_json_dict(request: WidgetRequest) -> dict[str, Any]:
     return widget
 
 
+def widget_s3_key(request: WidgetRequest) -> str:
+    """Return the S3 key a widget is stored under: widgets/{owner}/{id}."""
+    owner_prefix = request.owner.replace(" ", "-").lower()
+    return f"widgets/{owner_prefix}/{request.widget_id}"
+
+
 def handle_create_request(
     request: WidgetRequest,
     *,
@@ -229,8 +235,7 @@ def handle_create_request(
         if widget_s3_client is None:
             raise ValueError("An S3 client is required for S3 widget storage.")
 
-        owner_prefix = request.owner.replace(" ", "-").lower()
-        key = f"widgets/{owner_prefix}/{request.widget_id}"
+        key = widget_s3_key(request)
         body = json.dumps(widget_as_json_dict(request))
 
         widget_s3_client.put_object(
@@ -264,11 +269,171 @@ def handle_create_request(
     raise ValueError("No widget storage destination was configured.")
 
 
-def handle_update_request(request: WidgetRequest) -> None:
-    logging.warning(
-        "Update requests are not implemented yet (request ID: %s).",
-        request.request_id,
-    )
+# DynamoDB key attributes that an update must never change.
+PROTECTED_DYNAMODB_ATTRIBUTES = {"id", "widget_id"}
+
+
+def merge_widget_update(
+    widget: dict[str, Any], request: WidgetRequest
+) -> dict[str, Any]:
+    """Return a copy of a stored S3 widget with the update applied.
+
+    Fields in the request replace the stored values. An attribute whose new
+    value is an empty string is removed; other attributes are added or
+    replaced. Attributes the request does not mention are left alone.
+    """
+    updated = dict(widget)
+    updated["owner"] = request.owner
+    if request.label is not None:
+        updated["label"] = request.label
+    if request.description is not None:
+        updated["description"] = request.description
+
+    if request.other_attributes:
+        attributes = {
+            item["name"]: item["value"]
+            for item in widget.get("otherAttributes", [])
+        }
+        for attribute in request.other_attributes:
+            if attribute.value == "":
+                attributes.pop(attribute.name, None)
+            else:
+                attributes[attribute.name] = attribute.value
+        if attributes:
+            updated["otherAttributes"] = [
+                {"name": name, "value": value}
+                for name, value in attributes.items()
+            ]
+        else:
+            updated.pop("otherAttributes", None)
+
+    return updated
+
+
+def build_dynamodb_update(request: WidgetRequest) -> dict[str, Any]:
+    """Build the update_item arguments (minus Key) for an update request.
+
+    Uses placeholders (#n0, :v0) for every name and value, because attribute
+    names such as "width-unit" are not valid in a DynamoDB expression.
+    The condition makes the update fail if the widget does not exist,
+    rather than quietly creating a partial widget.
+    """
+    fields: dict[str, str] = {"owner": request.owner}
+    if request.label is not None:
+        fields["label"] = request.label
+    if request.description is not None:
+        fields["description"] = request.description
+
+    removals: list[str] = []
+    for attribute in request.other_attributes or []:
+        if attribute.name in PROTECTED_DYNAMODB_ATTRIBUTES:
+            logging.warning(
+                "Ignoring attribute %r in request %s: it is a key attribute.",
+                attribute.name,
+                request.request_id,
+            )
+            continue
+        if attribute.value == "":
+            removals.append(attribute.name)
+            fields.pop(attribute.name, None)
+        else:
+            fields[attribute.name] = attribute.value
+            if attribute.name in removals:
+                removals.remove(attribute.name)
+
+    names: dict[str, str] = {"#id": "id"}
+    values: dict[str, str] = {}
+    set_parts: list[str] = []
+    remove_parts: list[str] = []
+
+    for index, (name, value) in enumerate(fields.items()):
+        names[f"#n{index}"] = name
+        values[f":v{index}"] = value
+        set_parts.append(f"#n{index} = :v{index}")
+
+    for index, name in enumerate(removals):
+        names[f"#r{index}"] = name
+        remove_parts.append(f"#r{index}")
+
+    expression = "SET " + ", ".join(set_parts)
+    if remove_parts:
+        expression += " REMOVE " + ", ".join(remove_parts)
+
+    return {
+        "UpdateExpression": expression,
+        "ConditionExpression": "attribute_exists(#id)",
+        "ExpressionAttributeNames": names,
+        "ExpressionAttributeValues": values,
+    }
+
+
+def handle_update_request(
+    request: WidgetRequest,
+    *,
+    widget_s3_client: BaseClient | None = None,
+    widget_bucket: str | None = None,
+    dynamodb_table: Any = None,
+) -> bool:
+    """Update an existing widget in S3 or DynamoDB.
+
+    Returns True if the widget was updated, or False if it does not exist.
+    A missing widget is logged as a warning, not an error: with a standard
+    SQS queue an update can arrive before its create, or after a delete.
+    """
+    if widget_bucket is not None:
+        if widget_s3_client is None:
+            raise ValueError("An S3 client is required for S3 widget storage.")
+
+        key = widget_s3_key(request)
+        try:
+            s3_object = widget_s3_client.get_object(Bucket=widget_bucket, Key=key)
+        except ClientError as error:
+            if error.response.get("Error", {}).get("Code") in {
+                "NoSuchKey", "404",
+            }:
+                logging.warning(
+                    "Update failed: widget %s does not exist "
+                    "(s3://%s/%s, request ID: %s).",
+                    request.widget_id, widget_bucket, key, request.request_id,
+                )
+                return False
+            raise
+
+        try:
+            widget = json.loads(s3_object["Body"].read())
+        finally:
+            s3_object["Body"].close()
+
+        widget_s3_client.put_object(
+            Bucket=widget_bucket,
+            Key=key,
+            Body=json.dumps(merge_widget_update(widget, request)),
+            ContentType="application/json",
+        )
+        logging.info("Updated widget in S3: s3://%s/%s", widget_bucket, key)
+        return True
+
+    if dynamodb_table is not None:
+        try:
+            dynamodb_table.update_item(
+                Key={"id": request.widget_id},
+                **build_dynamodb_update(request),
+            )
+        except ClientError as error:
+            if error.response.get("Error", {}).get("Code") == (
+                "ConditionalCheckFailedException"
+            ):
+                logging.warning(
+                    "Update failed: widget %s does not exist in DynamoDB "
+                    "(request ID: %s).",
+                    request.widget_id, request.request_id,
+                )
+                return False
+            raise
+        logging.info("Updated widget in DynamoDB: %s", request.widget_id)
+        return True
+
+    raise ValueError("No widget storage destination was configured.")
 
 
 def handle_delete_request(request: WidgetRequest) -> None:
@@ -294,7 +459,12 @@ def process_requests(
                 dynamodb_table=dynamodb_table,
             )
         elif request.request_type == "update":
-            handle_update_request(request)
+            handle_update_request(
+                request,
+                widget_s3_client=widget_s3_client,
+                widget_bucket=widget_bucket,
+                dynamodb_table=dynamodb_table,
+            )
         elif request.request_type == "delete":
             handle_delete_request(request)
         else:
