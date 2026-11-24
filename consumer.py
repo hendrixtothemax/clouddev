@@ -4,10 +4,10 @@ import json
 import logging
 import time
 from typing import Any
+from abc import ABC, abstractmethod
 
 import boto3
 from botocore.client import BaseClient
-
 
 @dataclass
 class WidgetAttribute:
@@ -46,32 +46,112 @@ class WidgetRequest:
             other_attributes=attributes or None,
         )
 
+# Readers
+class RequestReader(ABC):
+    """A source of widget requests (an S3 bucket or an SQS queue).
 
-def new_requests(client: BaseClient, bucket: str) -> list[WidgetRequest]:
-    """Read and delete at most one request from the request bucket."""
-    if not bucket or not bucket.strip():
-        raise ValueError("A request bucket name is required.")
+    Callers fetch with get_next_request(), process the request, and then
+    call delete_request() so the source does not hand it out again.
+    """
 
-    response = client.list_objects_v2(Bucket=bucket, MaxKeys=1)
-    contents = response.get("Contents", [])
-    if not contents:
-        return []
+    @abstractmethod
+    def get_next_request(self) -> WidgetRequest | None:
+        """Return the next request, or None if none are available."""
 
-    key = contents[0]["Key"]
-    s3_object = client.get_object(Bucket=bucket, Key=key)
+    @abstractmethod
+    def delete_request(self, request: WidgetRequest) -> None:
+        """Remove a processed request from its source."""
 
-    try:
-        request_data = json.loads(s3_object["Body"].read())
-    finally:
-        s3_object["Body"].close()
-
-    request = WidgetRequest.from_dict(request_data)
-
-    # Remove the request only after it has been read and parsed successfully.
-    client.delete_object(Bucket=bucket, Key=key)
-    return [request]
+    @staticmethod
+    def parse_request(raw_body: str | bytes) -> WidgetRequest | None:
+        """Parse a JSON request body, or return None if it is malformed."""
+        try:
+            return WidgetRequest.from_dict(json.loads(raw_body))
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+            logging.error("Discarding malformed request: %s", error)
+            return None
 
 
+class S3RequestReader(RequestReader):
+    """Reads one request object at a time from an S3 bucket."""
+
+    def __init__(self, client: BaseClient, bucket: str) -> None:
+        if not bucket or not bucket.strip():
+            raise ValueError("A request bucket name is required.")
+        self.client = client
+        self.bucket = bucket
+        # request_id -> S3 key, so delete_request knows which object to remove.
+        self._keys: dict[str, str] = {}
+
+    def get_next_request(self) -> WidgetRequest | None:
+        response = self.client.list_objects_v2(Bucket=self.bucket, MaxKeys=1)
+        contents = response.get("Contents", [])
+        if not contents:
+            return None
+
+        key = contents[0]["Key"]
+        s3_object = self.client.get_object(Bucket=self.bucket, Key=key)
+        try:
+            body = s3_object["Body"].read()
+        finally:
+            s3_object["Body"].close()
+
+        request = self.parse_request(body)
+        if request is None:
+            # Remove it now, or the next listing returns the same bad object.
+            self.client.delete_object(Bucket=self.bucket, Key=key)
+            logging.error("Deleted malformed request s3://%s/%s", self.bucket, key)
+            return None
+
+        self._keys[request.request_id] = key
+        logging.info(
+            "Retrieved request %s from s3://%s/%s",
+            request.request_id, self.bucket, key,
+        )
+        return request
+
+    def delete_request(self, request: WidgetRequest) -> None:
+        key = self._keys.pop(request.request_id)
+        self.client.delete_object(Bucket=self.bucket, Key=key)
+        logging.info("Deleted request object s3://%s/%s", self.bucket, key)
+
+
+class SqsRequestReader(RequestReader):
+    """Reads requests from an SQS queue in batches of up to 10.
+
+    TODO (Step 2/3):
+      get_next_request:
+        - If the cache is empty, call receive_message with QueueUrl,
+          MaxNumberOfMessages=10 and WaitTimeSeconds=self.wait_seconds.
+        - For each message, parse msg["Body"] with self.parse_request().
+          Malformed bodies: delete the message now (no DLQ is configured).
+          Good ones: append (request, msg["ReceiptHandle"]) to self._cache.
+        - Pop the first cached entry, remember its receipt handle in
+          self._receipt_handles, and return the request (None if empty).
+      delete_request:
+        - Pop the receipt handle for request.request_id and call
+          delete_message(QueueUrl=..., ReceiptHandle=...).
+    """
+
+    def __init__(
+        self, client: BaseClient, queue_url: str, wait_seconds: int = 10
+    ) -> None:
+        if not queue_url or not queue_url.strip():
+            raise ValueError("A request queue URL is required.")
+        self.client = client
+        self.queue_url = queue_url
+        self.wait_seconds = wait_seconds
+        self._cache: list[tuple[WidgetRequest, str]] = []
+        self._receipt_handles: dict[str, str] = {}
+
+    def get_next_request(self) -> WidgetRequest | None:
+        raise NotImplementedError("SQS retrieval is not implemented yet.")
+
+    def delete_request(self, request: WidgetRequest) -> None:
+        raise NotImplementedError("SQS message deletion is not implemented yet.")
+
+
+# Request Processing
 def widget_as_json_dict(request: WidgetRequest) -> dict[str, Any]:
     """Return the widget properties using the request schema's field names."""
     widget: dict[str, Any] = {
@@ -180,6 +260,60 @@ def process_requests(
             )
 
 
+def run_consumer_loop(
+    reader: RequestReader,
+    *,
+    widget_s3_client: BaseClient | None = None,
+    widget_bucket: str | None = None,
+    dynamodb_table: Any = None,
+    max_runtime_seconds: float = 0,
+    idle_sleep_seconds: float = 0.1,
+    report_interval_seconds: float = 5,
+) -> int:
+    """Fetch, process and delete requests until the runtime limit is reached.
+
+    Returns the number of requests processed (useful for tests).
+    """
+    start_time = time.monotonic()
+    last_report = start_time
+    processed = 0
+
+    while True:
+        now = time.monotonic()
+        if max_runtime_seconds > 0 and now - start_time >= max_runtime_seconds:
+            logging.info("Maximum runtime reached; stopping consumer.")
+            break
+
+        if now - last_report >= report_interval_seconds:
+            print(f"Processed requests: {processed}")
+            last_report = now
+
+        request = reader.get_next_request()
+        if request is None:
+            # SQS long polling already waits; this mainly throttles S3 listing.
+            time.sleep(idle_sleep_seconds)
+            continue
+
+        try:
+            process_requests(
+                [request],
+                widget_s3_client=widget_s3_client,
+                widget_bucket=widget_bucket,
+                dynamodb_table=dynamodb_table,
+            )
+            processed += 1
+        except Exception:
+            logging.exception(
+                "Failed to process request %s", request.request_id
+            )
+        # The request is deleted even if processing failed: there is no
+        # dead-letter queue, so a request that always fails would otherwise
+        # come back forever.
+        reader.delete_request(request)
+
+    return processed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Consumer for widget processing"
@@ -248,13 +382,11 @@ def main() -> None:
         profile_name=args.profile,
         region_name=args.region,
     )
-    request_s3_client = None
-    sqs_client = None
-
+    reader: RequestReader
     if args.request_queue:
-        sqs_client = session.client("sqs")
+        reader = SqsRequestReader(session.client("sqs"), args.request_queue)
     else:
-        request_s3_client = session.client("s3")
+        reader = S3RequestReader(session.client("s3"), args.request_bucket)
 
     widget_s3_client = None
     dynamodb_table = None
@@ -280,41 +412,16 @@ def main() -> None:
             args.widget_key_prefix,
         )
 
-    start_time = time.monotonic()
     max_runtime_seconds = args.max_runtime / 1000
 
     print('Starting Consumer Loop...\n')
-    REPORT_TIME = 5
-    SLEEP_TIME = 0.1
-    LOOPS = 0
-    PROCESSED_REQUESTS = 0
-    while True:
-        if (
-            max_runtime_seconds > 0
-            and time.monotonic() - start_time >= max_runtime_seconds
-        ):
-            logging.info("Maximum runtime reached; stopping consumer.")
-            break
-
-        requests = new_requests(request_s3_client, args.request_bucket)
-        if requests:
-            PROCESSED_REQUESTS += 1
-            logging.info("Request detected; processing.")
-            process_requests(
-                requests,
-                widget_s3_client=widget_s3_client,
-                widget_bucket=args.widget_bucket,
-                dynamodb_table=dynamodb_table,
-            )
-        else:
-            time.sleep(0.1)
-
-        if SLEEP_TIME * LOOPS >= REPORT_TIME:
-            print("REPORTING")
-            print(f"Processed Requests: {PROCESSED_REQUESTS}")
-            LOOPS = 0
-
-        LOOPS += 1
+    run_consumer_loop(
+        reader,
+        widget_s3_client=widget_s3_client,
+        widget_bucket=args.widget_bucket,
+        dynamodb_table=dynamodb_table,
+        max_runtime_seconds=max_runtime_seconds,
+    )
 
 
 if __name__ == "__main__":
