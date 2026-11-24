@@ -1,7 +1,11 @@
 import argparse
+from collections import Counter
 from dataclasses import dataclass
 import json
 import logging
+import os
+import socket
+import sys
 import time
 from typing import Any
 from abc import ABC, abstractmethod
@@ -9,6 +13,52 @@ from abc import ABC, abstractmethod
 import boto3
 from botocore.client import BaseClient
 from botocore.exceptions import ClientError
+
+# One logger per component. The name appears in every log line, so the output
+# shows which part of the consumer wrote it. All are children of "consumer",
+# which is where configure_logging attaches the handlers.
+log = logging.getLogger("consumer")
+settings_log = logging.getLogger("consumer.settings")
+sqs_log = logging.getLogger("consumer.sqs")
+s3_log = logging.getLogger("consumer.s3")
+widget_log = logging.getLogger("consumer.widgets")
+loop_log = logging.getLogger("consumer.loop")
+
+LOG_FORMAT = "%(asctime)s [%(threadName)s] %(levelname)-5s %(name)s - %(message)s"
+
+
+def configure_logging(
+    log_file: str | None = "consumer.log",
+    level: int = logging.INFO,
+    stream: Any = None,
+) -> None:
+    """Send consumer logs to the terminal (stdout) and to a log file.
+
+    The file always gets DEBUG and above, so it has the full record. The
+    terminal gets `level` and above (INFO by default), so it stays readable.
+    stdout is what `docker run`, `docker logs` and CloudWatch show.
+    """
+    formatter = logging.Formatter(LOG_FORMAT)
+
+    log.setLevel(logging.DEBUG)
+    for handler in list(log.handlers):
+        log.removeHandler(handler)
+        handler.close()
+
+    console = logging.StreamHandler(stream or sys.stdout)
+    console.setLevel(level)
+    console.setFormatter(formatter)
+    log.addHandler(console)
+
+    if log_file:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(formatter)
+        log.addHandler(file_handler)
+
+    # AWS SDK chatter (credential lookups, retries) only when it matters.
+    for name in ("boto3", "botocore", "urllib3"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 @dataclass
 class WidgetAttribute:
@@ -69,7 +119,7 @@ class RequestReader(ABC):
         try:
             return WidgetRequest.from_dict(json.loads(raw_body))
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
-            logging.error("Discarding malformed request: %s", error)
+            log.error("Discarding malformed request: %s", error)
             return None
 
 
@@ -101,11 +151,11 @@ class S3RequestReader(RequestReader):
         if request is None:
             # Remove it now, or the next listing returns the same bad object.
             self.client.delete_object(Bucket=self.bucket, Key=key)
-            logging.error("Deleted malformed request s3://%s/%s", self.bucket, key)
+            s3_log.error("Deleted malformed request s3://%s/%s", self.bucket, key)
             return None
 
         self._keys[request.request_id] = key
-        logging.info(
+        s3_log.info(
             "Retrieved request %s from s3://%s/%s",
             request.request_id, self.bucket, key,
         )
@@ -114,7 +164,7 @@ class S3RequestReader(RequestReader):
     def delete_request(self, request: WidgetRequest) -> None:
         key = self._keys.pop(request.request_id)
         self.client.delete_object(Bucket=self.bucket, Key=key)
-        logging.info("Deleted request object s3://%s/%s", self.bucket, key)
+        s3_log.debug("Deleted request object s3://%s/%s", self.bucket, key)
 
 
 class SqsRequestReader(RequestReader):
@@ -152,13 +202,15 @@ class SqsRequestReader(RequestReader):
     def delete_request(self, request: WidgetRequest) -> None:
         receipt_handle = self._receipt_handles.pop(request.request_id, None)
         if receipt_handle is None:
-            logging.warning(
+            sqs_log.warning(
                 "No receipt handle for request %s; nothing to delete.",
                 request.request_id,
             )
             return
         self._delete_message(receipt_handle)
-        logging.info("Deleted request %s from queue.", request.request_id)
+        # DEBUG: goes to the log file (the system test counts these lines)
+        # but not the terminal, where it would double every request.
+        sqs_log.debug("Deleted request %s from queue.", request.request_id)
 
     def _fill_cache(self) -> None:
         """Receive up to 10 messages and cache the ones that parse."""
@@ -169,7 +221,7 @@ class SqsRequestReader(RequestReader):
         )
         messages = response.get("Messages", [])
         if messages:
-            logging.info("Received %d message(s) from queue.", len(messages))
+            sqs_log.info("Received %d message(s) from queue.", len(messages))
 
         for message in messages:
             receipt_handle = message["ReceiptHandle"]
@@ -178,7 +230,7 @@ class SqsRequestReader(RequestReader):
                 # No dead-letter queue is configured, so a malformed message
                 # would otherwise be redelivered forever.
                 self._delete_message(receipt_handle)
-                logging.error(
+                sqs_log.error(
                     "Deleted malformed message %s from queue.",
                     message.get("MessageId"),
                 )
@@ -193,7 +245,7 @@ class SqsRequestReader(RequestReader):
         except ClientError as error:
             # Usually an expired receipt handle (visibility timeout passed);
             # the message will be redelivered and handled again.
-            logging.error("Failed to delete message from queue: %s", error)
+            sqs_log.error("Failed to delete message from queue: %s", error)
 
 
 # Request Processing
@@ -244,7 +296,10 @@ def handle_create_request(
             Body=body,
             ContentType="application/json",
         )
-        logging.info("Created widget in S3: s3://%s/%s", widget_bucket, key)
+        widget_log.info(
+            "Created widget in S3: s3://%s/%s (request %s)",
+            widget_bucket, key, request.request_id,
+        )
         return
 
     if dynamodb_table is not None:
@@ -263,7 +318,10 @@ def handle_create_request(
                 item[attribute.name] = attribute.value
 
         dynamodb_table.put_item(Item=item)
-        logging.info("Created widget in DynamoDB: %s", request.widget_id)
+        widget_log.info(
+            "Created widget in DynamoDB: %s (request %s, owner %s)",
+            request.widget_id, request.request_id, request.owner,
+        )
         return
 
     raise ValueError("No widget storage destination was configured.")
@@ -327,7 +385,7 @@ def build_dynamodb_update(request: WidgetRequest) -> dict[str, Any]:
     removals: list[str] = []
     for attribute in request.other_attributes or []:
         if attribute.name in PROTECTED_DYNAMODB_ATTRIBUTES:
-            logging.warning(
+            widget_log.warning(
                 "Ignoring attribute %r in request %s: it is a key attribute.",
                 attribute.name,
                 request.request_id,
@@ -391,7 +449,7 @@ def handle_update_request(
             if error.response.get("Error", {}).get("Code") in {
                 "NoSuchKey", "404",
             }:
-                logging.warning(
+                widget_log.warning(
                     "Update failed: widget %s does not exist "
                     "(s3://%s/%s, request ID: %s).",
                     request.widget_id, widget_bucket, key, request.request_id,
@@ -410,7 +468,10 @@ def handle_update_request(
             Body=json.dumps(merge_widget_update(widget, request)),
             ContentType="application/json",
         )
-        logging.info("Updated widget in S3: s3://%s/%s", widget_bucket, key)
+        widget_log.info(
+            "Updated widget in S3: s3://%s/%s (request %s)",
+            widget_bucket, key, request.request_id,
+        )
         return True
 
     if dynamodb_table is not None:
@@ -423,24 +484,70 @@ def handle_update_request(
             if error.response.get("Error", {}).get("Code") == (
                 "ConditionalCheckFailedException"
             ):
-                logging.warning(
+                widget_log.warning(
                     "Update failed: widget %s does not exist in DynamoDB "
                     "(request ID: %s).",
                     request.widget_id, request.request_id,
                 )
                 return False
             raise
-        logging.info("Updated widget in DynamoDB: %s", request.widget_id)
+        widget_log.info(
+            "Updated widget in DynamoDB: %s (request %s)",
+            request.widget_id, request.request_id,
+        )
         return True
 
     raise ValueError("No widget storage destination was configured.")
 
 
 def handle_delete_request(request: WidgetRequest) -> None:
-    logging.warning(
+    widget_log.warning(
         "Delete requests are not implemented yet (request ID: %s).",
         request.request_id,
     )
+
+
+# Outcome labels, in the order the progress summary lists them.
+OUTCOMES = (
+    "created",
+    "updated",
+    "update failed",
+    "delete not implemented",
+    "unsupported",
+    "error",
+)
+
+
+def process_request(
+    request: WidgetRequest,
+    *,
+    widget_s3_client: BaseClient | None = None,
+    widget_bucket: str | None = None,
+    dynamodb_table: Any = None,
+) -> str:
+    """Handle one request and return its outcome label (see OUTCOMES)."""
+    storage = {
+        "widget_s3_client": widget_s3_client,
+        "widget_bucket": widget_bucket,
+        "dynamodb_table": dynamodb_table,
+    }
+    if request.request_type == "create":
+        handle_create_request(request, **storage)
+        return "created"
+    if request.request_type == "update":
+        return "updated" if handle_update_request(request, **storage) else (
+            "update failed"
+        )
+    if request.request_type == "delete":
+        handle_delete_request(request)
+        return "delete not implemented"
+
+    widget_log.warning(
+        "Unsupported request type %r (request ID: %s).",
+        request.request_type,
+        request.request_id,
+    )
+    return "unsupported"
 
 
 def process_requests(
@@ -449,30 +556,26 @@ def process_requests(
     widget_s3_client: BaseClient | None = None,
     widget_bucket: str | None = None,
     dynamodb_table: Any = None,
-) -> None:
-    for request in requests:
-        if request.request_type == "create":
-            handle_create_request(
-                request,
-                widget_s3_client=widget_s3_client,
-                widget_bucket=widget_bucket,
-                dynamodb_table=dynamodb_table,
-            )
-        elif request.request_type == "update":
-            handle_update_request(
-                request,
-                widget_s3_client=widget_s3_client,
-                widget_bucket=widget_bucket,
-                dynamodb_table=dynamodb_table,
-            )
-        elif request.request_type == "delete":
-            handle_delete_request(request)
-        else:
-            logging.warning(
-                "Unsupported request type %r (request ID: %s).",
-                request.request_type,
-                request.request_id,
-            )
+) -> list[str]:
+    """Handle several requests; returns their outcome labels."""
+    return [
+        process_request(
+            request,
+            widget_s3_client=widget_s3_client,
+            widget_bucket=widget_bucket,
+            dynamodb_table=dynamodb_table,
+        )
+        for request in requests
+    ]
+
+
+def format_outcomes(outcomes: Counter) -> str:
+    """E.g. '37 processed (created 28, updated 7, update failed 2)'."""
+    parts = [
+        f"{label} {outcomes[label]}" for label in OUTCOMES if outcomes[label]
+    ]
+    total = sum(outcomes.values())
+    return f"{total} processed" + (f" ({', '.join(parts)})" if parts else "")
 
 
 def run_consumer_loop(
@@ -487,20 +590,27 @@ def run_consumer_loop(
 ) -> int:
     """Fetch, process and delete requests until the runtime limit is reached.
 
-    Returns the number of requests processed (useful for tests).
+    Logs a progress summary every report_interval_seconds (only when
+    something changed) and a final summary when it stops. Returns the number
+    of requests handled without an exception (useful for tests).
     """
     start_time = time.monotonic()
     last_report = start_time
-    processed = 0
+    outcomes: Counter = Counter()
+    reported_total = 0
 
+    loop_log.info("Waiting for requests...")
     while True:
         now = time.monotonic()
         if max_runtime_seconds > 0 and now - start_time >= max_runtime_seconds:
-            logging.info("Maximum runtime reached; stopping consumer.")
+            loop_log.info("Maximum runtime reached; stopping consumer.")
             break
 
+        total = sum(outcomes.values())
         if now - last_report >= report_interval_seconds:
-            print(f"Processed requests: {processed}")
+            if total != reported_total:
+                loop_log.info("Progress: %s", format_outcomes(outcomes))
+                reported_total = total
             last_report = now
 
         request = reader.get_next_request()
@@ -510,23 +620,52 @@ def run_consumer_loop(
             continue
 
         try:
-            process_requests(
-                [request],
+            outcome = process_request(
+                request,
                 widget_s3_client=widget_s3_client,
                 widget_bucket=widget_bucket,
                 dynamodb_table=dynamodb_table,
             )
-            processed += 1
         except Exception:
-            logging.exception(
+            loop_log.exception(
                 "Failed to process request %s", request.request_id
             )
+            outcome = "error"
+        outcomes[outcome] += 1
         # The request is deleted even if processing failed: there is no
         # dead-letter queue, so a request that always fails would otherwise
         # come back forever.
         reader.delete_request(request)
 
-    return processed
+    loop_log.info("Consumer stopped. Final totals: %s", format_outcomes(outcomes))
+    return sum(outcomes.values()) - outcomes["error"]
+
+
+def log_settings(args: argparse.Namespace, reader: RequestReader) -> None:
+    """Log where the consumer is running and every setting it is using.
+
+    The hostname is the container ID when running in Docker, which tells
+    several consumers apart in screenshots and CloudWatch.
+    """
+    settings_log.info(
+        "Consumer starting (host=%s, pid=%d)", socket.gethostname(), os.getpid()
+    )
+    is_queue = isinstance(reader, SqsRequestReader)
+    settings = {
+        "profile": args.profile,
+        "region": args.region,
+        "request-bucket": args.request_bucket,
+        "request-queue": args.request_queue,
+        "max-runtime": args.max_runtime,
+        "widget-bucket": args.widget_bucket,
+        "widget-key-prefix": args.widget_key_prefix,
+        "dynamodb-widget-table": args.dynamodb_widget_table,
+        "queue-wait-timeout": reader.wait_seconds if is_queue else None,
+        "queue-batch-size": reader.MAX_BATCH_SIZE if is_queue else None,
+        "log-level": args.log_level,
+    }
+    for name, value in settings.items():
+        settings_log.info("%s: %s", name, value)
 
 
 def main() -> None:
@@ -587,13 +726,18 @@ def main() -> None:
         help="S3 key prefix for widgets (default: widgets/)",
     )
 
+    parser.add_argument(
+        "-ll",
+        "--log-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        default="INFO",
+        help="Lowest level shown in the terminal (default: INFO). "
+        "consumer.log always gets DEBUG and above.",
+    )
+
     args = parser.parse_args()
 
-    logging.basicConfig(
-        filename="consumer.log",
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+    configure_logging(level=getattr(logging, args.log_level))
 
     session = boto3.Session(
         profile_name=args.profile,
@@ -623,7 +767,7 @@ def main() -> None:
     # The handler's default key structure is widgets/{owner}/{widget_id}.
     # Override its prefix if a different prefix was supplied.
     if key_prefix != "widgets":
-        logging.warning(
+        settings_log.warning(
             "The requested key prefix %r is not used; widget keys use "
             "the required widgets/{owner}/{widget_id} format.",
             args.widget_key_prefix,
@@ -631,7 +775,7 @@ def main() -> None:
 
     max_runtime_seconds = args.max_runtime / 1000
 
-    print('Starting Consumer Loop...\n')
+    log_settings(args, reader)
     run_consumer_loop(
         reader,
         widget_s3_client=widget_s3_client,
