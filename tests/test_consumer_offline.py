@@ -1,15 +1,22 @@
+import io
 import json
+import logging
 from pathlib import Path
+import tempfile
 import unittest
 
 from botocore.exceptions import ClientError
 
 from consumer import (
+    RequestReader,
     WidgetRequest,
     build_dynamodb_update,
+    configure_logging,
+    format_outcomes,
     handle_create_request,
     handle_update_request,
     merge_widget_update,
+    run_consumer_loop,
     widget_as_json_dict,
     widget_s3_key,
 )
@@ -410,6 +417,135 @@ class HandleUpdateRequestTests(unittest.TestCase):
     def test_missing_storage_destination_raises_value_error(self) -> None:
         with self.assertRaisesRegex(ValueError, "No widget storage destination"):
             handle_update_request(make_update())
+
+
+class ConfigureLoggingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.consumer_log = logging.getLogger("consumer")
+        self.saved = (self.consumer_log.level, list(self.consumer_log.handlers))
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log_file = str(Path(self.tmp.name) / "consumer.log")
+        self.stream = io.StringIO()
+
+    def tearDown(self) -> None:
+        for handler in list(self.consumer_log.handlers):
+            self.consumer_log.removeHandler(handler)
+            handler.close()
+        level, handlers = self.saved
+        self.consumer_log.setLevel(level)
+        for handler in handlers:
+            self.consumer_log.addHandler(handler)
+        logging.getLogger("botocore").setLevel(logging.NOTSET)
+        self.tmp.cleanup()
+
+    def test_terminal_gets_info_and_file_gets_debug(self) -> None:
+        configure_logging(self.log_file, logging.INFO, stream=self.stream)
+        child = logging.getLogger("consumer.sqs")
+        child.info("visible everywhere")
+        child.debug("file only")
+
+        terminal = self.stream.getvalue()
+        file_text = Path(self.log_file).read_text(encoding="utf-8")
+        self.assertIn("visible everywhere", terminal)
+        self.assertNotIn("file only", terminal)
+        self.assertIn("visible everywhere", file_text)
+        self.assertIn("file only", file_text)
+
+    def test_line_format_shows_thread_level_and_logger(self) -> None:
+        configure_logging(None, logging.INFO, stream=self.stream)
+        logging.getLogger("consumer.widgets").error("boom")
+        self.assertRegex(
+            self.stream.getvalue(),
+            r"\[MainThread\] ERROR consumer\.widgets - boom",
+        )
+
+    def test_calling_twice_does_not_duplicate_lines(self) -> None:
+        configure_logging(None, logging.INFO, stream=self.stream)
+        configure_logging(None, logging.INFO, stream=self.stream)
+        logging.getLogger("consumer").info("once")
+        self.assertEqual(self.stream.getvalue().count("once"), 1)
+
+    def test_aws_sdk_logging_is_quieted(self) -> None:
+        configure_logging(None, logging.INFO, stream=self.stream)
+        self.assertEqual(
+            logging.getLogger("botocore").getEffectiveLevel(), logging.WARNING
+        )
+
+
+class FakeReader(RequestReader):
+    """Hands out a fixed list of requests and records which were deleted."""
+
+    def __init__(self, requests: list[WidgetRequest]) -> None:
+        self.requests = list(requests)
+        self.deleted: list[str] = []
+
+    def get_next_request(self):
+        return self.requests.pop(0) if self.requests else None
+
+    def delete_request(self, request) -> None:
+        self.deleted.append(request.request_id)
+
+
+class ConsumerLoopTests(unittest.TestCase):
+    def make(self, request_type: str, n: int) -> WidgetRequest:
+        return WidgetRequest.from_dict(
+            {
+                "type": request_type,
+                "requestId": f"{request_type}-{n}",
+                "widgetId": f"widget-{n}",
+                "owner": "Mary Matthews",
+            }
+        )
+
+    def test_counts_outcomes_and_deletes_every_request(self) -> None:
+        s3 = FakeS3()
+        reader = FakeReader(
+            [
+                self.make("create", 1),
+                self.make("update", 1),  # widget-1 exists -> updated
+                self.make("update", 2),  # widget-2 missing -> update failed
+                self.make("delete", 1),
+            ]
+        )
+        with self.assertLogs("consumer", level="INFO") as logs:
+            handled = run_consumer_loop(
+                reader,
+                widget_s3_client=s3,
+                widget_bucket="b",
+                max_runtime_seconds=0.2,
+                idle_sleep_seconds=0.01,
+            )
+
+        self.assertEqual(handled, 4)
+        self.assertEqual(
+            reader.deleted, ["create-1", "update-1", "update-2", "delete-1"]
+        )
+        final = [line for line in logs.output if "Final totals" in line]
+        self.assertEqual(len(final), 1)
+        self.assertIn(
+            "4 processed (created 1, updated 1, update failed 1, "
+            "delete not implemented 1)",
+            final[0],
+        )
+
+    def test_processing_error_is_logged_and_request_still_deleted(self) -> None:
+        reader = FakeReader([self.make("create", 1)])
+        with self.assertLogs("consumer", level="ERROR") as logs:
+            handled = run_consumer_loop(  # no storage -> ValueError
+                reader, max_runtime_seconds=0.1, idle_sleep_seconds=0.01
+            )
+        self.assertEqual(handled, 0)
+        self.assertEqual(reader.deleted, ["create-1"])
+        self.assertIn("Failed to process request create-1", logs.output[0])
+
+    def test_format_outcomes(self) -> None:
+        from collections import Counter
+
+        self.assertEqual(format_outcomes(Counter()), "0 processed")
+        self.assertEqual(
+            format_outcomes(Counter({"updated": 2, "created": 3})),
+            "5 processed (created 3, updated 2)",
+        )
 
 
 if __name__ == "__main__":
