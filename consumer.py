@@ -536,8 +536,10 @@ def main() -> None:
     parser.add_argument(
         "-p",
         "--profile",
-        default="default",
-        help="AWS profile to use (default: default)",
+        default=None,
+        help="AWS profile to use. If omitted, boto3's default lookup is used "
+        "(AWS_* environment variables, then the default profile), which is "
+        "what a container needs.",
     )
     parser.add_argument(
         "-r",
