@@ -3,6 +3,9 @@ sample-requests.zip
 .vscode
 s3_bucket_list.py
 
+/logs/*
+/system-test-logs/*
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

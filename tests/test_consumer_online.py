@@ -9,6 +9,8 @@ from consumer import (
     WidgetRequest,
     S3RequestReader,
     handle_create_request,
+    handle_update_request,
+    widget_s3_key,
 )
 
 
@@ -111,6 +113,98 @@ class ConsumerOnlineTests(unittest.TestCase):
             self.assertEqual(item["rating"], "5")
         finally:
             table.delete_item(Key={"id": widget_id})
+
+    def make_update(self, widget_id: str, **fields) -> WidgetRequest:
+        data = {
+            "type": "update",
+            "requestId": f"unit-test-{uuid.uuid4()}",
+            "widgetId": widget_id,
+            "owner": "Unit Test Owner",
+        }
+        data.update(fields)
+        return WidgetRequest.from_dict(data)
+
+    def test_update_widget_in_dynamodb_and_remove_it(self) -> None:
+        widget_id = f"unit-test-{uuid.uuid4()}"
+        table = self.dynamodb.Table(self.table_name)
+
+        try:
+            handle_create_request(self.make_request(widget_id), dynamodb_table=table)
+            updated = handle_update_request(
+                self.make_update(
+                    widget_id,
+                    label="updated-label",
+                    otherAttributes=[
+                        {"name": "width-unit", "value": "in"},
+                        {"name": "rating", "value": ""},
+                        {"name": "vendor", "value": "ACME"},
+                    ],
+                ),
+                dynamodb_table=table,
+            )
+            self.assertTrue(updated)
+
+            item = table.get_item(Key={"id": widget_id}, ConsistentRead=True)["Item"]
+            self.assertEqual(item["label"], "updated-label")
+            self.assertEqual(item["description"], "created by online unit test")
+            self.assertEqual(item["width-unit"], "in")
+            self.assertEqual(item["vendor"], "ACME")
+            self.assertNotIn("rating", item)
+        finally:
+            table.delete_item(Key={"id": widget_id})
+
+    def test_update_missing_widget_in_dynamodb_creates_nothing(self) -> None:
+        widget_id = f"unit-test-{uuid.uuid4()}"
+        table = self.dynamodb.Table(self.table_name)
+
+        updated = handle_update_request(
+            self.make_update(widget_id, label="should-not-exist"),
+            dynamodb_table=table,
+        )
+
+        self.assertFalse(updated)
+        response = table.get_item(Key={"id": widget_id}, ConsistentRead=True)
+        self.assertNotIn("Item", response)
+
+    def test_update_widget_in_bucket_3_and_remove_it(self) -> None:
+        widget_id = f"unit-test-{uuid.uuid4()}"
+        request = self.make_request(widget_id)
+        key = widget_s3_key(request)
+
+        try:
+            handle_create_request(
+                request, widget_s3_client=self.s3, widget_bucket=self.widget_bucket
+            )
+            updated = handle_update_request(
+                self.make_update(
+                    widget_id,
+                    description="updated description",
+                    otherAttributes=[{"name": "rating", "value": ""}],
+                ),
+                widget_s3_client=self.s3,
+                widget_bucket=self.widget_bucket,
+            )
+            self.assertTrue(updated)
+
+            response = self.s3.get_object(Bucket=self.widget_bucket, Key=key)
+            try:
+                stored = json.loads(response["Body"].read())
+            finally:
+                response["Body"].close()
+            self.assertEqual(stored["description"], "updated description")
+            self.assertEqual(stored["label"], "unit-test-label")
+            self.assertEqual(
+                stored["otherAttributes"], [{"name": "width-unit", "value": "cm"}]
+            )
+        finally:
+            self.s3.delete_object(Bucket=self.widget_bucket, Key=key)
+
+    def test_update_missing_widget_in_bucket_3_returns_false(self) -> None:
+        request = self.make_update(f"unit-test-{uuid.uuid4()}", label="nope")
+        updated = handle_update_request(
+            request, widget_s3_client=self.s3, widget_bucket=self.widget_bucket
+        )
+        self.assertFalse(updated)
 
     def test_read_and_delete_request_from_isolated_s3_bucket(self) -> None:
         bucket = os.environ.get("CONSUMER_TEST_REQUEST_BUCKET")

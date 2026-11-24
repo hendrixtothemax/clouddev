@@ -40,7 +40,8 @@ DEFAULT_QUEUE_URL = (
 
 # Consumer log lines (see consumer.py).
 CREATED_RE = re.compile(r"Created widget in (?:DynamoDB|S3)")
-UPDATE_RE = re.compile(r"Update requests are not implemented")
+UPDATE_RE = re.compile(r"Updated widget in (?:DynamoDB|S3)|Update failed:")
+UPDATE_FAILED_RE = re.compile(r"Update failed:")
 DELETE_RE = re.compile(r"Delete requests are not implemented")
 DELETED_RE = re.compile(r"Deleted request (\S+) from queue\.")
 # Producer log lines, e.g. "Generate a Create request", "Generate an Update request".
@@ -65,6 +66,7 @@ class ScenarioResult:
     failures: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     queue_drained: bool = False
+    failed_updates: int = 0
 
     @property
     def passed(self) -> bool:
@@ -196,6 +198,7 @@ def collect_results(
         updates = len(UPDATE_RE.findall(log))
         deletes = len(DELETE_RE.findall(log))
         result.handled.update(create=created, update=updates, delete=deletes)
+        result.failed_updates += len(UPDATE_FAILED_RE.findall(log))
         result.per_consumer.append(created + updates + deletes)
         result.deleted_ids.update(DELETED_RE.findall(log))
 
@@ -233,6 +236,13 @@ def evaluate(scenario: Scenario, result: ScenarioResult) -> None:
         )
     if scenario.consumers > 1 and 0 in result.per_consumer:
         result.failures.append("at least one consumer processed nothing")
+
+    # Updates for widgets that do not exist (yet) are expected; see Step 8.
+    if result.failed_updates:
+        result.warnings.append(
+            f"{result.failed_updates} of {result.handled['update']} updates "
+            "failed because the widget did not exist"
+        )
 
     # A standard queue may deliver a message more than once. That is
     # expected SQS behaviour, so it is reported but does not fail the test.
