@@ -50,6 +50,38 @@ python consumer.py -rb usu-cs5270-umi-requests -wb usu-cs5270-umi-dist -p cloudd
 
 Use `-r REGION` to select another AWS region, or `-mrt MILLISECONDS` to stop after a set time.
 
+To read requests from the SQS queue instead of S3 (use `-rq` or `-rb`, not both):
+
+```bash
+python consumer.py -rq https://sqs.us-east-1.amazonaws.com/<account-id>/cs5270-requests -dwt widgets -p clouddev
+```
+
+The consumer handles Create, Update and Delete requests. It deletes each message from the queue after processing it.
+
+Logs go to the terminal (`-ll DEBUG|INFO|WARNING|ERROR`, default `INFO`), and `consumer.log` always records `DEBUG` and above.
+
+### Run in Docker
+
+Put your AWS credentials in `docker.env` (it's in `.gitignore`), one per line: `AWS_ACCESS_KEY_ID=...`, `AWS_SECRET_ACCESS_KEY=...`, `AWS_SESSION_TOKEN=...`. Then build and run from the project root.
+
+#### Build the consumer image
+
+Run the build from the project root, not from `docker/`. The Dockerfile copies `requirements.txt` and `consumer.py` from the project root, so the build context (the trailing `.`) has to be the root. `-f` points to the Dockerfile and `-t` tags the image:
+
+```bash
+docker build -f docker/consumer.dockerfile -t consumer:latest .
+```
+
+`.dockerignore` sends only `consumer.py` and `requirements.txt` to the build, so logs, tests and credentials never end up in the image. Rebuild after you change `consumer.py` or `requirements.txt`. Use `docker images` to check that the image was built.
+
+#### Run the consumer container
+
+```bash
+docker run --rm --env-file docker.env consumer:latest
+```
+
+The image reads from the `cs5270-requests` queue and writes to the `widgets` table by default. To use other settings, add consumer arguments after the image name. `docker/producer.dockerfile` builds the producer in the same way.
+
 ## Run tests
 
 Offline tests use the local sample requests and do not call AWS:
@@ -67,3 +99,9 @@ python tests/run_unit_tests.py --suite online
 ```
 
 `OK` means the selected tests passed. `skipped` means a test was disabled or its required test resource was not configured. Failures or errors need investigation. Test output is saved under `consumer-logs/unit-tests/YYYY-MM/` with an incrementing version in the filename.
+
+The system test runs real consumers and producers against the SQS queue. It takes about 8 minutes and checks that every request was handled exactly once. Logs are saved under `system-test-logs/`:
+
+```bash
+python tests/system_test.py
+```
